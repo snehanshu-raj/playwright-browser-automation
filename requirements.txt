@@ -1,0 +1,6 @@
+mcp[cli]
+google-genai 
+python-dotenv 
+playwright
+fastapi
+uvicorn[standard]

@@ -1,0 +1,8 @@
+.env
+agent_google_sdk.py
+agent_manual.py
+*.json
+test_server.py
+node_modules
+.vscode
+__pycache__
