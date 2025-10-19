@@ -196,4 +196,141 @@ Try via Swagger as well: URL to visit when the server is running:
 
 ```
 
+## Complete Flow (at a glance):
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                            USER REQUEST                                 │
+│  curl -X POST /automate -d '{"goal": "Find laptop price on Amazon"}'    │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         FASTAPI SERVER (main.py)                        │
+│  • Receives HTTP request                                                │
+│  • Generates unique task_id                                             │
+│  • Creates task entry in memory store                                   │
+│  • Spawns background task                                               │
+│  • Returns 200 OK with task_id immediately                              │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    BACKGROUND TASK EXECUTOR                             │
+│  • Calls run_agent(goal, max_iterations)                                │
+│  • Initializes log_callback for real-time logging                       │
+│  • Updates task status: pending → running                               │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      AGENT ENGINE (agent.py)                            │
+│  ┌─────────────────────────────────────────────────────────────┐        │
+│  │  INITIALIZATION                                             │        │
+│  │  • Connect to Playwright MCP Server (via npx)               │        │
+│  │  • Load tools (32 Playwright automation tools)              │        │
+│  │  • Load SYSTEM_PROMPT_MANUAL from prompt.py                 │        │
+│  └─────────────────────────────────────────────────────────────┘        │
+│                                 │                                       │
+│                                 ▼                                       │
+│  ┌─────────────────────────────────────────────────────────────┐        │
+│  │  ITERATION LOOP (max 15 iterations be deafult)              │        │
+│  │                                                             │        │
+│  │  FOR i in range(max_iterations):                            │        │
+│  │    1. Build prompt with:                                    │        │
+│  │       - System instructions (Amazon-specific)               │        │
+│  │       - User goal                                           │        │
+│  │       - Previous action history (last 3 steps)              │        │
+│  │       - Reminder to return FINAL_ANSWER when done           │        │
+│  │                                                             │        │
+│  │    2. Call Gemini 2.0 Flash Lite API                        │        │
+│  │       → Returns: TOOL_CALL or FINAL_ANSWER                  │        │
+│  │                                                             │        │
+│  │    3. Parse response:                                       │        │
+│  │       - Extract tool_name and parameters                    │        │
+│  │       - Split on "|" delimiter (except playwright_evaluate) │        │
+│  │                                                             │        │
+│  │    4. Execute tool via MCP:                                 │        │
+│  │       session.call_tool(tool_name, args)                    │        │
+│  │                                                             │        │
+│  │    5. Capture result and update history                     │        │
+│  │       - Log to callback for API tracking                    │        │
+│  │       - Detect failures/success                             │        │
+│  │       - Append to action history                            │        │
+│  │                                                             │        │
+│  │    6. Check termination:                                    │        │
+│  │       IF "FINAL_ANSWER:" in response:                       │        │
+│  │         → Extract answer and RETURN                         │        │
+│  │       ELSE:                                                 │        │
+│  │         → Continue to next iteration                        │        │
+│  └─────────────────────────────────────────────────────────────┘        │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│               PLAYWRIGHT MCP SERVER (Node.js)                           │
+│  • Running as child process via npx                                     │
+│  • Manages Chromium browser instance (headless in Docker via xvfb)      │
+│  • Provides 32 tools:                                                   │
+│    - playwright_navigate                                                │
+│    - playwright_fill                                                    │
+│    - playwright_click                                                   │
+│    - playwright_evaluate (JavaScript execution)                         │
+│    - playwright_screenshot                                              │
+│    - etc.                                                               │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      CHROMIUM BROWSER                                   │
+│  • Launches via Playwright                                              │
+│  • Navigates to Amazon.com                                              │
+│  • Executes DOM interactions:                                           │
+│    - Fill search box: input[id="twotabsearchtextbox"]                   │
+│    - Click search: input[id="nav-search-submit-button"]                 │
+│    - Scroll: window.scrollBy(0, 800)                                    │
+│    - Extract price: document.querySelector('.a-price-whole')            │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       GEMINI AI (LLM)                                   │
+│  Model: gemini-2.0-flash-lite                                           │
+│  • Receives prompt with:                                                │
+│    - Goal: "Find laptop price on Amazon"                                │
+│    - Available tools                                                    │
+│    - Action history                                                     │
+│  • Reasons about next action                                            │
+│  • Returns structured response:                                         │
+│    TOOL_CALL: playwright_navigate | https://amazon.com                  │
+│    TOOL_CALL: playwright_fill | input[id="..."] | laptop                │
+│    TOOL_CALL: playwright_evaluate | document.querySelector(...)         │
+│    FINAL_ANSWER: The price is $899.00                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+                                 │
+                    ┌────────────┴────────────┐
+                    ▼                         ▼
+        ┌───────────────────────┐  ┌──────────────────────┐
+        │   SUCCESS PATH        │  │   FAILURE PATH       │
+        │                       │  │                      │
+        │ • Extract result      │  │ • Retry with alt     │
+        │ • Update task status  │  │   approach           │
+        │ • Return to user      │  │ • Log failure        │
+        │                       │  │ • Continue loop      │
+        └───────────────────────┘  └──────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           API RESPONSE                                  │
+│  GET /task/{task_id}                                                    │
+│  {                                                                      │
+│    "task_id": "abc-123",                                                │
+│    "status": "completed",                                               │
+│    "result": "The price is $899.00",                                    │
+│    "iterations_used": 5,                                                │
+│    "history": ["Navigate", "Fill", "Click", "Extract"],                 │
+│    "execution_log": [...]                                               │
+│  }                                                                      │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
 ---
